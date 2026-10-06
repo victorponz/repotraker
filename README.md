@@ -117,6 +117,28 @@ python3 repo_tracker.py history victorponz/javafx
 python3 repo_tracker.py history victorponz/javafx --csv
 ```
 
+### Importar desde archivo
+
+Con el comando
+
+```
+python3 repo_tracker.py import repos.txt
+```
+
+Se checkquean todos los repositorios del archivo `repos.txt`
+
+### Generar hoja de cálculo
+
+Se pueden exportar los datos a una hoja de cálculo.
+
+```
+python3 repo_tracker.py xlsx informe.xlsx repos.txt
+```
+
+Este comando exporta a un workbook de nombre `informe.xlsx` creando una hoja para cada repositorio especificado en `repos.txt` El nombre cada hoja será el nombre real del usuario o, en su defecto, el `username`.
+
+Si vas a comprobar muchos repos, te interesa exportar `GITHUB_TOKEN`.
+
 ### Importante sobre los clones git
 
 Conectar Supabase no cambia cómo se obtienen los commits: el `clone`/`fetch` de git sigue siendo siempre local. Supabase solo sustituye **dónde se guarda** el estado y el historial.

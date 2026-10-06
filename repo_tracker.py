@@ -49,6 +49,12 @@ Uso con Supabase (estado + historial completo en la nube):
 Repositorio privado (token solo para esta ejecución):
     export GITHUB_TOKEN=ghp_xxx
     python3 repo_tracker.py check owner/repo-privado
+
+Exportar a Excel (una hoja por repositorio, commits enlazados a GitHub):
+    python3 repo_tracker.py xlsx informe.xlsx repos.txt
+    # repos.txt tiene el mismo formato que el de 'import': un repositorio
+    # por línea (URL o 'owner/repo'), líneas vacías y comentarios con #
+    # Requiere openpyxl: pip install openpyxl
 """
 
 import argparse
@@ -86,6 +92,35 @@ def load_local_state() -> dict:
 def save_local_state(state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+
+
+# --------------------------------------------------------------------------
+# API de GitHub: nombre completo del propietario de un repo
+# --------------------------------------------------------------------------
+
+def fetch_github_display_name(owner: str, token: str | None) -> str:
+    """Consulta la API pública de GitHub para obtener el nombre completo del
+    usuario/organización 'owner'. Si no lo tiene puesto en el perfil (campo
+    'name' vacío/null) o falla la consulta, devuelve el propio username."""
+    url = f"https://api.github.com/users/{urllib.parse.quote(owner)}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "repo_tracker.py",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f"Aviso: no se pudo obtener el nombre completo de '{owner}' (HTTP {e.code}); uso el username.")
+        return owner
+    except urllib.error.URLError as e:
+        print(f"Aviso: no se pudo obtener el nombre completo de '{owner}' ({e.reason}); uso el username.")
+        return owner
+    name = (data.get("name") or "").strip()
+    return name or owner
 
 
 # --------------------------------------------------------------------------
@@ -501,6 +536,137 @@ def cmd_import(args):
     store.flush()
 
 
+def _commits_for_export(store: Store, key: str, info: dict) -> list[dict] | None:
+    """Devuelve el historial completo de commits de un repo para exportarlo,
+    con 'num' asignado en cada commit. Usa el histórico guardado en Supabase
+    si existe; si no (backend local, o todavía no se ha hecho ningún check),
+    lo reconstruye leyendo el log completo del clon local en caché.
+    Devuelve None si no hay ningún dato disponible (ni Supabase ni clon local)."""
+    if store.use_supabase:
+        commits = store.get_commit_history(key)
+        if commits:
+            return commits
+
+    path = cache_path(key)
+    if not (path.exists() and is_valid_bare_repo(path)):
+        return None
+    branch = info.get("branch") or default_branch(path)
+    raw = log_numstat(path, branch)
+    commits = parse_log(raw)
+    for i, c in enumerate(commits, start=1):
+        c["num"] = i
+    return commits
+
+
+def _sheet_name_factory():
+    """Genera nombres de hoja válidos y únicos para Excel a partir del
+    nombre completo del propietario del repo, desambiguando con el nombre
+    del repo si dos coincidieran tras limpiar caracteres no válidos."""
+    used: dict[str, bool] = {}
+    invalid_chars = set('[]:*?/\\')
+
+    def clean(s: str) -> str:
+        s = "".join(c for c in s if c not in invalid_chars).strip()
+        return (s or "repo")[:31]
+
+    def make(display_name: str, repo_name: str) -> str:
+        candidate = clean(display_name)
+        if candidate.lower() in used:
+            candidate = clean(f"{display_name} ({repo_name})")
+        n = 2
+        while candidate.lower() in used:
+            suffix = f" ({n})"
+            candidate = clean(display_name)[: 31 - len(suffix)] + suffix
+            n += 1
+        used[candidate.lower()] = True
+        return candidate
+
+    return make
+
+
+def cmd_xlsx(args):
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print("Esta función necesita la librería 'openpyxl'. Instálala con: pip install openpyxl")
+        return
+
+    store = make_store(args)
+    token = resolve_token(args)
+
+    repos_path = Path(args.repos_file)
+    try:
+        refs = read_repo_file(repos_path)
+    except FileNotFoundError as e:
+        print(str(e))
+        return
+    if not refs:
+        print(f"'{repos_path}' no contiene ningún repositorio.")
+        return
+
+    keys = []
+    for ref in refs:
+        try:
+            key, _ = normalize_repo(ref)
+        except ValueError as e:
+            print(f"Aviso: {e}")
+            continue
+        keys.append(key)
+
+    if not keys:
+        print(f"'{repos_path}' no contiene ningún repositorio válido.")
+        return
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    sheet_name_for = _sheet_name_factory()
+
+    header_font = Font(name="Arial", bold=True)
+    normal_font = Font(name="Arial")
+    link_font = Font(name="Arial", color="0563C1", underline="single")
+    headers = ["#", "Commit", "Fecha", "Mensaje", "Añadidas", "Eliminadas"]
+    col_widths = [6, 12, 22, 70, 10, 10]
+
+    exported = 0
+    display_name_cache: dict[str, str] = {}
+    for key in keys:
+        info = store.get_repo(key) or {"branch": None}
+        owner, repo_name = key.split("/", 1)
+        if owner not in display_name_cache:
+            display_name_cache[owner] = fetch_github_display_name(owner, token)
+        display_name = display_name_cache[owner]
+        commits = _commits_for_export(store, key, info)
+
+        ws = wb.create_sheet(title=sheet_name_for(display_name, repo_name))
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font = header_font
+        ws.freeze_panes = "A2"
+
+        if commits is None:
+            ws.append(["", "(sin clon local; ejecuta 'check' o 'import' primero)", "", "", "", ""])
+            for cell in ws[2]:
+                cell.font = normal_font
+        else:
+            for c in commits:
+                ws.append([c.get("num", ""), c["sha"][:7], c["date"], c["subject"], c["added"], c["removed"]])
+                row_idx = ws.max_row
+                for col in range(1, 7):
+                    ws.cell(row=row_idx, column=col).font = normal_font
+                commit_cell = ws.cell(row=row_idx, column=2)
+                commit_cell.hyperlink = f"https://github.com/{owner}/{repo_name}/commit/{c['sha']}"
+                commit_cell.font = link_font
+            exported += 1
+
+        for i, w in enumerate(col_widths, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+    wb.save(args.file)
+    print(f"Generado '{args.file}' con {len(keys)} hoja(s) ({exported} con datos de commits).")
+
+
 def _check_one(store: Store, key: str, export_csv: bool, token: str | None) -> None:
     info = store.get_repo(key)
     path = cache_path(key)
@@ -658,6 +824,11 @@ def main():
     p_import.add_argument("--token", help="Token de GitHub (para repos privados). También se puede definir GITHUB_TOKEN.")
     p_import.add_argument("--csv", action="store_true", help="Exporta también un CSV con los resultados de cada check")
     p_import.set_defaults(func=cmd_import)
+
+    p_xlsx = sub.add_parser("xlsx", help="Genera un Excel con una hoja por repositorio y enlaces a cada commit en GitHub", parents=[common])
+    p_xlsx.add_argument("file", help="Ruta del fichero .xlsx a generar")
+    p_xlsx.add_argument("repos_file", help="Fichero de texto con un repositorio por línea (mismo formato que 'import')")
+    p_xlsx.set_defaults(func=cmd_xlsx)
 
     p_check = sub.add_parser("check", help="Comprueba commits nuevos desde la última vez", parents=[common])
     p_check.add_argument("repo", nargs="?", help="URL de GitHub u 'owner/repo'")
